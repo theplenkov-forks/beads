@@ -5,7 +5,7 @@ description: End-to-end testing recipes for the `bd github-sync` and `bd dolt pu
 
 # beads github-sync end-to-end testing
 
-## Devin Secrets Needed
+## Agent secrets needed
 
 - `BD_GITHUB_CLIENT_ID` / `BD_GITHUB_CLIENT_SECRET` — only needed for a live OAuth device-flow test against GitHub.
 - `BD_GITLAB_CLIENT_ID` / `BD_GITLAB_CLIENT_SECRET` — only needed for GitLab OAuth.
@@ -25,10 +25,14 @@ make test         # runs scripts/test.sh with isolated BEADS_HOME
 
 ## CLI smoke tests
 
+Run from the repository root where `make build` produced `./bd`:
+
 ```bash
 ./bd github-sync --help
+./bd github-sync status --provider auto --host github.com --json
+./bd github-sync status --provider gh --host github.com --json
 ./bd github-sync status --provider oauth --host github.com --json
-./bd github-sync status --provider oauth --host github.com
+./bd github-sync login --provider oauth --host github.com --dry-run
 ./bd github-sync git-credential --help   # hidden command
 ```
 
@@ -40,11 +44,11 @@ make test         # runs scripts/test.sh with isolated BEADS_HOME
 Use a temp `FAKE_BIN` directory on the front of `PATH` so `bd` resolves the fake binary instead of the system `gh`/`glab`.
 
 - Fake `gh` must accept `auth status --hostname <host>` and exit 0, and `auth git-credential get` and print:
-  ```
+  ```text
   username=oauth2
   password=<token>
   ```
-- Fake `glab` must accept `auth status --hostname <host>` (exit 0) and `auth status --show-token` printing a line matching `token[:=]\\s*([A-Za-z0-9_\\-\\.]+)`.
+- Fake `glab` must accept `auth status --hostname <host>` (exit 0) and `auth status --show-token` printing a line matching `token[:=]\s*([A-Za-z0-9_.-]+)`.
 
 Expected `status` JSON:
 
@@ -58,28 +62,65 @@ Expected `status` JSON:
 `withRemoteAuth` builds a `GIT_CONFIG_PARAMETERS` string that installs a per-command credential helper and disables client hooks. You can verify it in a disposable workspace with an invalid remote and a `git` wrapper on `PATH`:
 
 ```bash
-mkdir -p /tmp/fakebin
-cat > /tmp/fakebin/git <<'EOF'
-#!/bin/bash
-echo "invoked git $*" >> /tmp/fakebin/git.log
-echo "  GIT_CONFIG_PARAMETERS=$GIT_CONFIG_PARAMETERS" >> /tmp/fakebin/git.log
-/usr/bin/git "$@"
-EOF
-chmod +x /tmp/fakebin/git
+# capture paths before we shadow git and cd to the test workspace
+REPO=$(pwd)
+REAL_GIT=$(command -v git)
+FAKEBIN=$(mktemp -d)
+TESTDIR=$(mktemp -d)
+export FAKEBIN REAL_GIT
+trap 'rm -rf "$FAKEBIN" "$TESTDIR"' EXIT
 
-# create workspace and remote
-rm -rf /tmp/bdtest && mkdir /tmp/bdtest && cd /tmp/bdtest
-/home/ubuntu/repos/beads/bd init --prefix tst --skip-hooks --skip-agents --non-interactive
-/home/ubuntu/repos/beads/bd dolt remote add origin https://invalidhost.invalid/repo.git
+cat > "$FAKEBIN/git" <<'EOF'
+#!/bin/bash
+echo "invoked git $*" >> "$FAKEBIN/git.log"
+echo "  GIT_CONFIG_PARAMETERS=$GIT_CONFIG_PARAMETERS" >> "$FAKEBIN/git.log"
+if [[ "$1" == "push" || "$1" == "fetch" || "$1" == "ls-remote" ]]; then
+  exit 0
+fi
+PATH=/usr/bin:/bin "$REAL_GIT" "$@"
+EOF
+chmod +x "$FAKEBIN/git"
+
+# create fake delegated binaries
+cat > "$FAKEBIN/gh" <<'EOF'
+#!/bin/bash
+if [[ "$1 $2" == "auth status" ]]; then
+  exit 0
+elif [[ "$1 $2 $3" == "auth git-credential" ]]; then
+  read -r line
+  case "$line" in
+    protocol=https|host=*|*) ;;
+  esac
+  echo "username=oauth2"
+  echo "password=fake-gh-token"
+fi
+EOF
+chmod +x "$FAKEBIN/gh"
+
+cat > "$FAKEBIN/glab" <<'EOF'
+#!/bin/bash
+if [[ "$1 $2" == "auth status" ]]; then
+  if [[ "$*" == *"--show-token"* ]]; then
+    echo "token=fake-glab-token"
+  fi
+  exit 0
+fi
+EOF
+chmod +x "$FAKEBIN/glab"
+
+# create workspace and remote in the temp dir
+cd "$TESTDIR"
+"$REPO/bd" init --prefix tst --skip-hooks --skip-agents --non-interactive
+"$REPO/bd" dolt remote add origin https://invalidhost.invalid/repo.git
 
 # run with fake gh and git wrapper
-PATH="/tmp/fakebin:$PATH" /home/ubuntu/repos/beads/bd dolt push --auth gh --remote origin
+PATH="$FAKEBIN:$PATH" "$REPO/bd" dolt push --auth gh --remote origin
 ```
 
-Inspect `/tmp/fakebin/git.log`; it should contain an entry like:
+Inspect `$FAKEBIN/git.log`; it should contain an entry like:
 
-```
-credential.https://invalidhost.invalid.helper=!/tmp/fakebin/gh auth git-credential' 'core.hooksPath=/dev/null'
+```text
+credential.https://invalidhost.invalid.helper=!/tmp/tmp.XXXXXX/gh auth git-credential' 'core.hooksPath=/dev/null'
 ```
 
 For `--auth glab` the string also contains `'http.https://...proactiveAuth=basic'`. For `--auth oauth` it points back to the `bd` binary with `github-sync git-credential`.
@@ -87,13 +128,14 @@ For `--auth glab` the string also contains `'http.https://...proactiveAuth=basic
 ## Manual `git credential fill` verification
 
 ```bash
-export GIT_CONFIG_PARAMETERS="'core.hooksPath=/dev/null' 'credential.https://github.com.helper=!/tmp/fakebin/gh auth git-credential'"
+# use the same $FAKEBIN from the previous recipe, or set it to a directory containing the fake gh binary
+export GIT_CONFIG_PARAMETERS="'core.hooksPath=/dev/null' 'credential.https://github.com.helper=!$FAKEBIN/gh auth git-credential'"
 printf 'protocol=https\nhost=github.com\n\n' | git credential fill
 ```
 
 Expected output:
 
-```
+```text
 protocol=https
 host=github.com
 username=oauth2
@@ -112,8 +154,8 @@ go test ./internal/syncauth -run TestOAuthLoginStoresToken -v
 To exercise the CLI path without network:
 
 ```bash
-bd github-sync login --provider oauth --host github.com --dry-run
-bd github-sync login --provider oauth --host github.com
+./bd github-sync login --provider oauth --host github.com --dry-run
+./bd github-sync login --provider oauth --host github.com
 ```
 
 The first prints `Would log in to github.com using oauth`. The second errors cleanly with a missing `client_id` message.
