@@ -31,6 +31,7 @@ Run from the repository root where `make build` produced `./bd`:
 ./bd github-sync --help
 ./bd github-sync status --provider auto --host github.com --json
 ./bd github-sync status --provider gh --host github.com --json
+./bd github-sync status --provider glab --host gitlab.com --json
 ./bd github-sync status --provider oauth --host github.com --json
 ./bd github-sync login --provider oauth --host github.com --dry-run
 ./bd github-sync git-credential --help   # hidden command
@@ -43,7 +44,7 @@ Run from the repository root where `make build` produced `./bd`:
 
 Use a temp `FAKE_BIN` directory on the front of `PATH` so `bd` resolves the fake binary instead of the system `gh`/`glab`.
 
-- Fake `gh` must accept `auth status --hostname <host>` and exit 0, and `auth git-credential get` and print:
+- Fake `gh` must accept `auth status --hostname <host>` and exit 0, `auth git-credential <operation>` with the git credential-helper protocol, and optionally `auth token`:
   ```text
   username=oauth2
   password=<token>
@@ -64,7 +65,7 @@ Expected `status` JSON:
 ```bash
 # capture paths before we shadow git and cd to the test workspace
 REPO=$(pwd)
-REAL_GIT=$(command -v git)
+REAL_GIT=$(type -P git 2>/dev/null || command -v git)
 FAKEBIN=$(mktemp -d)
 TESTDIR=$(mktemp -d)
 export FAKEBIN REAL_GIT
@@ -86,13 +87,18 @@ cat > "$FAKEBIN/gh" <<'EOF'
 #!/bin/bash
 if [[ "$1 $2" == "auth status" ]]; then
   exit 0
-elif [[ "$1 $2 $3" == "auth git-credential" ]]; then
-  read -r line
-  case "$line" in
-    protocol=https|host=*|*) ;;
-  esac
+elif [[ "$1 $2" == "auth token" ]]; then
+  echo "fake-gh-token"
+  exit 0
+elif [[ "$1 $2" == "auth git-credential" ]]; then
+  while IFS= read -r line; do
+    case "$line" in
+      protocol=https|host=*|*) ;;
+    esac
+  done
   echo "username=oauth2"
   echo "password=fake-gh-token"
+  exit 0
 fi
 EOF
 chmod +x "$FAKEBIN/gh"
@@ -103,6 +109,11 @@ if [[ "$1 $2" == "auth status" ]]; then
   if [[ "$*" == *"--show-token"* ]]; then
     echo "token=fake-glab-token"
   fi
+  exit 0
+elif [[ "$1 $2" == "auth git-credential" ]]; then
+  while IFS= read -r line; do : ; done
+  echo "username=oauth2"
+  echo "password=fake-glab-token"
   exit 0
 fi
 EOF
@@ -130,7 +141,7 @@ For `--auth glab` the string also contains `'http.https://...proactiveAuth=basic
 ```bash
 # use the same $FAKEBIN from the previous recipe, or set it to a directory containing the fake gh binary
 export GIT_CONFIG_PARAMETERS="'core.hooksPath=/dev/null' 'credential.https://github.com.helper=!$FAKEBIN/gh auth git-credential'"
-printf 'protocol=https\nhost=github.com\n\n' | git credential fill
+printf 'protocol=https\nhost=github.com\n\n' | PATH="$FAKEBIN:$PATH" git credential fill
 ```
 
 Expected output:
