@@ -92,6 +92,7 @@ elif [[ "$1 $2" == "auth token" ]]; then
   exit 0
 elif [[ "$1 $2" == "auth git-credential" ]]; then
   while IFS= read -r line; do
+    [[ -z "$line" ]] && break
     case "$line" in
       protocol=https|host=*|*) ;;
     esac
@@ -111,7 +112,9 @@ if [[ "$1 $2" == "auth status" ]]; then
   fi
   exit 0
 elif [[ "$1 $2" == "auth git-credential" ]]; then
-  while IFS= read -r line; do : ; done
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && break
+  done
   echo "username=oauth2"
   echo "password=fake-glab-token"
   exit 0
